@@ -192,9 +192,10 @@ class PowerCircuit:
                     statedb.append((0, diode_addr, None, Rd))
             else:
                 statedb.append((None, 0, None, 0))
-        return statedb
+        self.statedb = statedb
     
     def create_matrix(self):
+        self.enum_switch_states()
         num_switch_states = 2 ** self.num_switches
         num_diode_states = 2 ** self.num_diodes
 
@@ -210,7 +211,7 @@ class PowerCircuit:
         self.C = np.zeros(states + self.Cshape)
         self.D = np.zeros(states + self.Dshape)
 
-        for state in self.enum_switch_states():
+        for state in self.statedb:
             sw = state[0]
             d = state[1]
             RDB = {}
@@ -218,54 +219,70 @@ class PowerCircuit:
                 RDB[self.switch_R[i]] = state[2][i]
             for i in range(self.num_diodes):
                 RDB[self.diode_R[i]] = state[3][i]
-            print(self.switch_db)
-            print(self.diode_R)
-            print(self.switch_R)
-            print(RDB)
             subcircuit = self.expanded_circuit.subs(RDB)
             substate = subcircuit.state_space()
-            self.A[sw][d] = np.array(substate.A.tolist(), dtype=float)
-            self.B[sw][d] = np.array(substate.B.tolist(), dtype=float)
-            self.C[sw][d] = np.array(substate.C.tolist(), dtype=float)
+            try:
+                self.A[sw][d] = np.array(substate.A.tolist(), dtype=float)
+                self.B[sw][d] = np.array(substate.B.tolist(), dtype=float)
+                self.C[sw][d] = np.array(substate.C.tolist(), dtype=float)
+            except:
+                print("No reactive elements found")
+                # TODO check this in sim
             self.D[sw][d] = np.array(substate.D.tolist(), dtype=float)
             print(". ", end="")
 
     def sim(self):
-        input = np.array([[0.0], [0.7]])
-        t = np.linspace(0, 0.06, 57)
-        dt = 0.06 / 200
-        #x = np.array([np.zeros(len(ss.A.tolist()[0]))], dtype=float)
-
-        # xdot = A @ x + B @ input
-        # print(type(x), type(xdot * dt) )
-        # x += xdot * dt
-        # y = C @ x + D @ input
-        Vin = 2.5 * np.sin(6.28 * 50 * t)
+        sw_addr = 0
+        d_addr = 0
+        A = self.A[sw_addr][d_addr]
+        B = self.B[sw_addr][d_addr]
+        C = self.C[sw_addr][d_addr]
+        D = self.D[sw_addr][d_addr]
+        u = np.ones((len(self.expanded_inputs), 1)) * self.Vf
+        print(self.Dshape, D, u, len(self.expanded_inputs))
+        t = np.linspace(0, 0.06, 1001)
+        dt = 0.06 / 1000
+        x = np.zeros((self.Ashape[0], 1), dtype=float)
+        xdot = A @ x + B @ u
+        print(x)
+        x += xdot * dt
+        y = C @ x + D @ u
+        Vin = 12 * np.sin(6.28 * 50 * t)
         Id = np.zeros(len(Vin))
         Vd = np.zeros(len(Vin))
+        Vo = np.zeros(len(Vin))
         k = self.diode_I_V_output_indices[0]
+
         for i in range(len(Vin)):
             Vi = Vin[i]
-            V = input[1][0]
-            input[0][0] = Vi
-            output = np.array(ss.D.tolist()) @ input
-            Vdi = output[k][0] * R_D0 + 0.7
-            Vd[i] = Vdi
-            if output[k][0] < 0.7 / 1e6 / 1000:
-                input[1][0] = 0.7
-                ct = self.expanded_circuit.subs({"R_D0": 1e6})
-                ss = ct.state_space()
-                R_D0 = 1e6
+            u[0][0] = Vi
+
+            xdot = A @ x + B @ u
+            x += xdot * dt
+            output = C @ x + D @ u
+            #output = D @ u
+            Id0 = output[k][0]
+            Vd[i] = output[2][0]
+            Vo[i] = output[1][0]
+            if Id0 < 0.7/1e9:
+                d_state = 0
+                d_addr = 0
+                #R_D0 = 1e6
             else:
-                input[1][0] = 0.7
-                ct = self.expanded_circuit.subs({"R_D0": 0.01})
-                ss = ct.state_space()
-                R_D0 = 0.01
-            if input[1][0] != Id[i-1]:
+                d_state = 1
+                d_addr = 1               
+                #R_D0 = 0.01
+            A = self.A[sw_addr][d_addr]
+            B = self.B[sw_addr][d_addr]
+            C = self.C[sw_addr][d_addr]
+            D = self.D[sw_addr][d_addr]
+
+            if Id0 != Id[i-1]:
                 #pass
-                output = np.array(ss.D.tolist()) @ input
-            Id[i] = output[k][0]
-        return Vin, Id, Vd
+                output = C @ x + D @ u
+                Id0 = output[k][0]
+            Id[i] = Id0
+        return Vin, Id, Vd, Vo
         
     def __str__(self):
         s  = "PowerCircuit with netlist:\n"
@@ -285,41 +302,37 @@ class PowerCircuit:
 
 
 original_netlist = """
-V1 1 0 3
-D0 2 0
-D5 2 0
-D2 2 0
-D3 2 0
-R1 1 2 1
-C1 2 0 1e-4
+V1 1 0 5
+D0 1 2
+R1 2 0 100
+R2 2 3 0.1
+C1 3 0 1e-3
 #SW1 1 0
 """
 
 pc = PowerCircuit(original_netlist)
 print(pc)
-import sys; sys.exit(0)
-Vin, Id, Vd = pc.sim()
+
+Vin, Id, Vd, Vo = pc.sim()
 t = np.arange(len(Vin))
 
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()
 ax.set_title("Diode test")
-ax.set(xlabel="tVin")
-ax.set(ylabel="Idiode")
-ax.plot(t, Vin, linewidth=1)
-ax.plot(t, Id, linewidth=1, color="tab:green")
-#ax.plot(t, Vd, linewidth=1, color="tab:red")
-#ax.legend()
+ax.set(xlabel="t")
+ax.set(ylabel="V(V)")
+ax2 = ax.twinx()
+ax2.set(ylabel="I(A)")
+ax.plot(t, Vin, linewidth=1, label="Vin")
+ax2.plot(t, Id, linewidth=1, label="Idiode", color="tab:green")
+ax.plot(t, Vd, linewidth=1, label="Vout", color="tab:red")
+#ax.legend(loc="lower left")
+#ax2.legend()
 
 
 
-# Define the diode parameters (e.g., for the ON state)
-# Note: In Lcapy, one can pass parameters as a dict to analysis methods
-diode_params = {
-    'R_D1': 0.1,  # Low resistance when ON
-    'V_D1': 0.7   # Forward voltage drop
-}
+
 
 
 
