@@ -24,7 +24,7 @@ Rdf = 0.05     # Diode forward resistance
 Rdb = 1e6      # Diode blocking is modeled as a resistance state
 
 
-def bool_pow(n, prev=[], result = []):
+def bool_pow(n, prev=[]):
     """
     Boolean powerset of size n, where n is an integer.
     Creates a set of lists of boolean variables with all distinct possibilities.
@@ -33,16 +33,13 @@ def bool_pow(n, prev=[], result = []):
     blocking).
     """
     if n <= 0:
-        result.append(prev)
+        return [prev]
     else:
         t = prev.copy()
         t.append(True)
         f = prev.copy()
         f.append(False)
-        bool_pow(n-1, f, result)
-        bool_pow(n-1, t, result)
-        if prev == []:
-            return result
+        return bool_pow(n-1, f) + bool_pow(n-1, t)
 
 
 """
@@ -62,8 +59,8 @@ class PowerCircuit:
         self.Rdf = 0.05
         self.Rdb = 1e6
 
-        self.expanded_netlist, self.symbolic_netlist, self.diode_db = self.expand_netlist(netlist)
-        #self.expanded_netlist += "\nV5 5 0\n"
+        self.expanded_netlist, self.symbolic_netlist, self.switch_db, \
+            self.diode_db = self.expand_netlist(netlist)
         self.expanded_circuit = Circuit(self.expanded_netlist)
         self.symbolic_circuit = Circuit(self.symbolic_netlist)
         self.expanded_statespace = self.expanded_circuit.state_space()
@@ -71,10 +68,10 @@ class PowerCircuit:
         assert(len(self.expanded_statespace.u) == len(self.symbolic_statespace.u))
         assert(len(self.expanded_statespace.x) == len(self.symbolic_statespace.x))
         assert(len(self.expanded_statespace.y) == len(self.symbolic_statespace.y))
+        self.switch_list = self.switch_db.keys()
         self.diode_list = self.diode_db.keys()
+        self.switch_R = [self.switch_db[switch] for switch in self.switch_list]
         self.diode_V = [self.diode_db[diode][0] for diode in self.diode_list]
-        #print("diode_V")
-        #print(self.diode_V)
         self.diode_R = [self.diode_db[diode][1] for diode in self.diode_list]
         self.diode_int = [self.diode_db[diode][2] for diode in self.diode_list]
         self.expanded_inputs = [str(inp) for inp in self.symbolic_statespace.u]
@@ -103,7 +100,6 @@ class PowerCircuit:
         self.diode_v_int_output_indices = [self.expanded_outputs.index("v_"+outp) for outp in self.diode_int]
         print("diode_v_int_output_indices:")
         print(self.diode_v_int_output_indices)
-        self.switch_list = []
         self.num_switches = len(self.switch_list)
         self.num_diodes = len(self.diode_list)
         self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
@@ -119,6 +115,7 @@ class PowerCircuit:
         lines = netlist_str.strip().split('\n')
         new_netlist = []
         new_symbolic_netlist = []
+        switches = {}
         diodes = {}
         
         for line in lines:
@@ -134,52 +131,54 @@ class PowerCircuit:
                 int_node = f"int_{name}"  # Internal node
                 
                 # Create the V_f source and the series resistance
-                # Use placeholders for values so they can be changed later
                 new_netlist.append(f"R_{name} {anode} {int_node} {{R_{name}}}")
                 new_netlist.append(f"V_{name} {int_node} {cathode} {self.Vf}")
-                new_symbolic_netlist.append(f"R_{name} {anode} {int_node} {{R_{name}}}")
-                new_symbolic_netlist.append(f"V_{name} {int_node} {cathode} {{Vf}}")
+                new_symbolic_netlist.append(f"R_{name} {anode} {int_node}")
+                new_symbolic_netlist.append(f"V_{name} {int_node} {cathode}")
                 diodes[name] = (f"V_{name}", f"R_{name}", f"int_{name}")
+            elif parts[0].startswith('SW') and len(parts) >= 3:
+                name = parts[0]           # e.g., SW1
+                Np = parts[1]             # e.g., 2
+                Nm = parts[2]             # e.g., 3
+                
+                # Create the switch resistance
+                new_netlist.append(f"R_{name} {Np} {Nm} {{R_{name}}}")
+                new_symbolic_netlist.append(f"R_{name} {Np} {Nm} {{R_{name}}}")
+                switches[name] = (f"R_{name}")
             else:
                 new_netlist.append(line)
                 new_symbolic_netlist.append(f"{parts[0]} {parts[1]} {parts[2]}")
-        return '\n'.join(new_netlist), '\n'.join(new_symbolic_netlist), diodes
+        return '\n'.join(new_netlist), '\n'.join(new_symbolic_netlist), switches, diodes
 
 
-    def create_matrix(self):
-        num_switch_states = 2 ** self.num_switches
-        num_diode_states = 2 ** self.num_diodes
-        self.Ashape = self.expanded_statespace.A.shape
-        self.Bshape = self.expanded_statespace.B.shape
-        self.Cshape = self.expanded_statespace.C.shape
-        self.Dshape = self.expanded_statespace.D.shape
-        states = (num_switch_states, num_diode_states)
-        self.A = np.zeros(states + self.Ashape)
-        self.B = np.zeros(states + self.Bshape)
-        self.C = np.zeros(states + self.Cshape)
-        self.D = np.zeros(states + self.Dshape)
-
+    def enum_switch_states(self):
         Rsw_on = self.Rds_on
         Rsw_off = self.Rds_off
         Rd_on = self.Rdf
         Rd_off = self.Rdb
 
-        
         switch_state_list = bool_pow(self.num_switches) if self.num_switches > 0 else []
+        #print("sw", switch_state_list)
         switch_state_array = np.array(switch_state_list, dtype=int)
+        #print("sw", switch_state_array)
         i_switch_state = np.dot(switch_state_array, self.switch_addr)
+        #print("swi", i_switch_state)
         diode_state_list = bool_pow(self.num_diodes) if self.num_diodes > 0 else []
-        diode_state_list *= np.ones(len(self.diode_list), dtype=int)
+        #print("d", diode_state_list)
         diode_state_array = np.array(diode_state_list, dtype=int)
-        i_diode_state = np.dot(diode_state_list, self.diode_addr)
+        #print("d", diode_state_array)
+        i_diode_state = np.dot(diode_state_array, self.diode_addr)
+        #print("di", i_diode_state)
         statedb = []
-        if isinstance(i_switch_state, list):
+        if isinstance(i_switch_state, np.ndarray):
             for i , switch_addr in enumerate(i_switch_state):
+                switch_addr = int(switch_addr)  # get rid of np.int64
                 switch_state = switch_state_array[i]
                 Rsw = Rds_on * switch_state + Rds_off * (1 - switch_state)
                 if isinstance(i_diode_state, np.ndarray):
                     for j , diode_addr in enumerate(i_diode_state):
-                        diode_state = diode_state_list[j]
+                        diode_addr = int(diode_addr)  # get rid of np.int64
+                        diode_state = diode_state_array[j]
                         Rd = Rdf * diode_state + Rdb * (1 - diode_state)
                         statedb.append((switch_addr, diode_addr, Rsw, Rd))
                 else:
@@ -187,25 +186,56 @@ class PowerCircuit:
         else:
             if isinstance(i_diode_state, np.ndarray):
                 for j , diode_addr in enumerate(i_diode_state):
-                    diode_state = diode_state_list[j]
+                    diode_addr = int(diode_addr)  # get rid of np.int64
+                    diode_state = diode_state_array[j]
                     Rd = Rdf * diode_state + Rdb * (1 - diode_state)
                     statedb.append((0, diode_addr, None, Rd))
             else:
                 statedb.append((None, 0, None, 0))
-        print(statedb)
+        return statedb
+    
+    def create_matrix(self):
+        num_switch_states = 2 ** self.num_switches
+        num_diode_states = 2 ** self.num_diodes
+
+        self.Ashape = self.expanded_statespace.A.shape
+        self.Bshape = self.expanded_statespace.B.shape
+        self.Cshape = self.expanded_statespace.C.shape
+        self.Dshape = self.expanded_statespace.D.shape
+
+        states = (num_switch_states, num_diode_states)
+
+        self.A = np.zeros(states + self.Ashape)
+        self.B = np.zeros(states + self.Bshape)
+        self.C = np.zeros(states + self.Cshape)
+        self.D = np.zeros(states + self.Dshape)
+
+        for state in self.enum_switch_states():
+            sw = state[0]
+            d = state[1]
+            RDB = {}
+            for i in range(self.num_switches):
+                RDB[self.switch_R[i]] = state[2][i]
+            for i in range(self.num_diodes):
+                RDB[self.diode_R[i]] = state[3][i]
+            print(self.switch_db)
+            print(self.diode_R)
+            print(self.switch_R)
+            print(RDB)
+            subcircuit = self.expanded_circuit.subs(RDB)
+            substate = subcircuit.state_space()
+            self.A[sw][d] = np.array(substate.A.tolist(), dtype=float)
+            self.B[sw][d] = np.array(substate.B.tolist(), dtype=float)
+            self.C[sw][d] = np.array(substate.C.tolist(), dtype=float)
+            self.D[sw][d] = np.array(substate.D.tolist(), dtype=float)
+            print(". ", end="")
 
     def sim(self):
-        R_D0 = 0.05
-        ct = self.expanded_circuit.subs({"R_D0": R_D0})
-        ss = ct.state_space()
         input = np.array([[0.0], [0.7]])
         t = np.linspace(0, 0.06, 57)
         dt = 0.06 / 200
         #x = np.array([np.zeros(len(ss.A.tolist()[0]))], dtype=float)
-        A = np.array(ss.A.tolist(), dtype=float)
-        B = np.array(ss.B.tolist(), dtype=float)
-        C = np.array(ss.C.tolist(), dtype=float)
-        D = np.array(ss.D.tolist(), dtype=float)
+
         # xdot = A @ x + B @ input
         # print(type(x), type(xdot * dt) )
         # x += xdot * dt
@@ -242,6 +272,8 @@ class PowerCircuit:
         s += self.netlist
         s += "\nExpanded netlist:\n"
         s += self.expanded_netlist
+        s += "\n\nSwitches:\n"
+        s += str(list(self.switch_list))
         s += "\n\nDiodes:\n"
         s += str(list(self.diode_list))
         s += "\n\nExpanded circuit inputs:\n"
@@ -260,9 +292,11 @@ D2 2 0
 D3 2 0
 R1 1 2 1
 C1 2 0 1e-4
+#SW1 1 0
 """
 
 pc = PowerCircuit(original_netlist)
+print(pc)
 import sys; sys.exit(0)
 Vin, Id, Vd = pc.sim()
 t = np.arange(len(Vin))
@@ -278,7 +312,7 @@ ax.plot(t, Id, linewidth=1, color="tab:green")
 #ax.plot(t, Vd, linewidth=1, color="tab:red")
 #ax.legend()
 
-print(pc)
+
 
 # Define the diode parameters (e.g., for the ON state)
 # Note: In Lcapy, one can pass parameters as a dict to analysis methods
