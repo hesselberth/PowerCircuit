@@ -77,48 +77,35 @@ class PowerCircuit:
         self.diode_R = [self.diode_db[diode][1] for diode in self.diode_list]
         self.diode_int = [self.diode_db[diode][2] for diode in self.diode_list]
         self.expanded_inputs = [str(inp) for inp in self.symbolic_statespace.u]
-        self.expanded_outputs = [str(inp) for inp in self.symbolic_statespace.y]
+        self.expanded_outputs = [str(outp)[:-3] for outp in self.symbolic_statespace.y]
         self.num_expanded_inputs = len(self.expanded_inputs)
         self.num_expanded_outputs = len(self.expanded_outputs)
-        self.diode_V_input_indices = [self.expanded_inputs.index(Vstr) for Vstr in self.diode_V]
-        print("diode_V_input_indices:")
-        print(self.diode_V_input_indices)
 
-        self.input_indices = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
-        self.u = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
-        self.u = np.array([self.u]).T
-
-        print("expanded_statespace.u:")
-        print(self.expanded_statespace.u)
-        self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
-        print("expanded_input_indices:")
-        print(self.expanded_input_indices)
-        self.expanded_outputs = [str(outp)[:-3] for outp in self.symbolic_statespace.y]
-        print("expanded_outputs:")
-        print(self.expanded_outputs)
-        self.diode_I_V_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_V]
-        print("diode_I_V_output_indices:")
-        print(self.diode_I_V_output_indices)
-        self.diode_I_R_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_R]
-        print("diode_I_R_output_indices:")
-        print(self.diode_I_R_output_indices)
-        self.diode_v_int_output_indices = [self.expanded_outputs.index("v_"+outp) for outp in self.diode_int]
-        print("diode_v_int_output_indices:")
-        print(self.diode_v_int_output_indices)
-        self.num_switches = len(self.switch_list)
-        self.num_diodes = len(self.diode_list)
-        self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
-        self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
-        self.create_matrix()
-        
         self.u = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
         self.u = np.array([self.u]).T
         self.s = list(self.switch_list)
-        print("u", self.u)
-        print(self.u.shape)
-        print(self.s)
+        self.x = [str(x)[:-3] for x in self.symbolic_statespace.x.tolist()[0]]
+        self.x = np.array([self.x]).T
+        # TODO: check x
+        self.y = self.expanded_outputs
+        self.dy = self.ydict()
+
+        self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
+        self.diode_V_input_indices = [self.expanded_inputs.index(Vstr) for Vstr in self.diode_V]
+        self.diode_I_V_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_V]
+        self.diode_I_R_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_R]
+        self.diode_v_int_output_indices = [self.expanded_outputs.index("v_"+outp) for outp in self.diode_int]
+
+        self.input_indices = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
+
         self.num_inputs = self.u.shape[0]
-        print(self.num_inputs)
+        self.num_switches = len(self.switch_list)
+        self.num_diodes = len(self.diode_list)
+
+        self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
+        self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
+        
+        self.create_matrix()
 
     def expand_netlist(self, netlist_str):
         """
@@ -247,6 +234,21 @@ class PowerCircuit:
             self.D[sw][d] = np.array(substate.D.tolist(), dtype=float)
             print(". ", end="")
 
+    def ydict(self):
+        d = {name : i for i, name in enumerate(self.expanded_outputs)}
+        for d_name in self.diode_db:
+            V, R, internal_node = self.diode_db[d_name]
+            del d["v_" + internal_node]
+            del d["i_" + R]
+            d["i_"+d_name] = d["i_" + V]
+            del d["i_" + V]
+        for sw_name in self.switch_db:
+            R = self.switch_db[sw_name]
+            d["i_"+sw_name] = d["i_" + R]
+            del d["i_" + R]
+        s = {key: d[key] for key in sorted(d, key=d.get)}  # ordered by key
+        return s
+            
     def t(self, *args):
         if len(args) <2:
             raise ValueError("t requires 2 or 3 arguments \
@@ -290,18 +292,18 @@ class PowerCircuit:
             raise ValueError(f"Input array must have shape (m, 1) or (m, n) " 
                               "where m is the number of inputs.")
         if len(s) == self.num_switches:  # Values must be bool or 0/1
-            sw_addr = np.dot(s, self.switch_addr)
+            sw_addr = int(np.dot(s, self.switch_addr))
         else:
             raise ValueError(f"Circuit has {self.num_switches} switches, "
-                              "got {len(s)}.")
+                             f"got {len(s)}.")
 
         if x != None:
             if x.shape != (self.Ashape[0], 1):
                 raise(ValueError(f"x should have shape {self.Ashape}, "
-                                  "(got {x.shape}."))
+                                 f"(got {x.shape}."))
         else:
             x = np.zeros((self.Ashape[0], 1), dtype=float)
-        print("A", self.Ashape, x)
+
         d_addr = 0
         prev_d_addr = d_addr
         if self.Ashape == (0, 0):
@@ -323,7 +325,7 @@ class PowerCircuit:
         
         for i in range(n):
             if not fixed_input:
-                u = u_exp[:, i]
+                u = u_exp[:, [i]]
 
             if LC:
                 xdot = A @ x + B @ u
@@ -344,10 +346,10 @@ class PowerCircuit:
             if d_addr != prev_d_addr:
                 y = C @ x + D @ u
 
-            print("y", y)
-            output[:, i] = y
+            #print("y", y)
+            output[:, [i]] = y
 
-        return output
+        return {k: output[i] for k, i in self.dy.items() }
         
     def __str__(self):
         s  = "PowerCircuit with netlist:\n"
@@ -365,8 +367,17 @@ class PowerCircuit:
         return s
         
 
+netlist = """
+V1 1 3 0
+D0 0 1
+D1 1 2
+D2 0 3
+D3 3 2
+R1 2 0 25
+C1 2 0 1e-3
+"""
 
-original_netlist = """
+netlist = """
 V1 1 0 5
 V2 5 0 7
 D0 1 2
@@ -374,28 +385,27 @@ D1 1 2
 R1 2 0 100
 R2 2 3 0.1
 C1 3 0 1e-3
-SW1 1 0
 """
 
-pc = PowerCircuit(original_netlist)
+
+
+pc = PowerCircuit(netlist)
 print(pc)
 
 t = pc.t(60e-3, 1e-8)
-print(len(t))
 
 t = np.linspace(0, 0.06, 10001)
 dt = 0.06 / 10000
 
-Vin = 12 * np.sin(6.28 * 100 * t)
+Vin = 12 * np.sin(6.28 * 50 * t)
 n = len(Vin)
 u = np.array([Vin, Vin])
-print(u)
-result = pc.sim_step(u, [0], n, dt)
 
-print(result)
+y = pc.sim_step(u, [], n, dt)
+print(pc.x) 
 
 import sys
-sys.exit(0)
+#sys.exit(0)
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()
@@ -404,9 +414,9 @@ ax.set(xlabel="t")
 ax.set(ylabel="V(V)")
 ax2 = ax.twinx()
 ax2.set(ylabel="I(A)")
-ax.plot(t, Vin, linewidth=1, label="Vin")
-ax2.plot(t, Id, linewidth=1, label="Idiode", color="tab:green")
-ax.plot(t, Vd, linewidth=1, label="Vout", color="tab:red")
+ax.plot(t, y["v_1"], linewidth=1, label="Vin")
+ax2.plot(t, y["i_D0"], linewidth=1, label="Idiode", color="tab:green")
+ax.plot(t, y["v_2"], linewidth=1, label="Vout", color="tab:red")
 #ax.legend(loc="lower left")
 #ax2.legend()
 
