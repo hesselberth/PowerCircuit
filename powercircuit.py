@@ -21,7 +21,7 @@ Rds_on = 0.01  # SWitch on
 Rds_off = 1e7  # SWitch off is modeled as a high resistance state
 Vf = 0.7       # Diode voltage drop
 Rdf = 0.05     # Diode forward resistance
-Rdb = 1e6      # Diode blocking is modeled as a resistance state
+Rdr = 1e6      # Diode reverse blocking is modeled as a resistance state
 
 
 """
@@ -31,7 +31,6 @@ generally impossible. To increase computational performance, all sympy
 matrices are therefore converted to numpy. This means that no component
 values may be left unspecified.
 """
-# TODO: check that
 class PowerCircuit:
     def __init__(self, netlist, **kwargs):
         self.netlist = netlist
@@ -40,24 +39,21 @@ class PowerCircuit:
         self.Rds_off = Rds_off
         self.Vf = Vf
         self.Rdf = Rdf
-        self.Rdb = Rdb
+        self.Rdr = Rdr
 
-        self.expanded_netlist, self.symbolic_netlist, self.switch_db, \
-            self.diode_db = self.expand_netlist(netlist)
+        self.expanded_netlist, self.switch_db, self.diode_db = \
+            self.expand_netlist(netlist)
         self.expanded_circuit = Circuit(self.expanded_netlist)
-        self.symbolic_circuit = Circuit(self.symbolic_netlist)
         self.expanded_statespace = self.expanded_circuit.state_space()
-        self.symbolic_statespace = self.symbolic_circuit.state_space()
-        assert(len(self.expanded_statespace.u) == len(self.symbolic_statespace.u))
-        assert(len(self.expanded_statespace.x) == len(self.symbolic_statespace.x))
-        assert(len(self.expanded_statespace.y) == len(self.symbolic_statespace.y))
+        
         self.switch_list = self.switch_db.keys()
         self.diode_list = self.diode_db.keys()
         self.switch_R = [self.switch_db[switch] for switch in self.switch_list]
         self.diode_V = [self.diode_db[diode][0] for diode in self.diode_list]
         self.diode_R = [self.diode_db[diode][1] for diode in self.diode_list]
         self.diode_int = [self.diode_db[diode][2] for diode in self.diode_list]
-        self.expanded_inputs = [str(inp) for inp in self.symbolic_statespace.u]
+        self.expanded_inputs = [str(inp) for inp in self.expanded_statespace.u]
+        
         self.expanded_outputs = [str(outp)[:-3] for outp in self.expanded_statespace.y]
         self.num_expanded_inputs = len(self.expanded_inputs)
         self.num_expanded_outputs = len(self.expanded_outputs)
@@ -65,11 +61,14 @@ class PowerCircuit:
         self.u = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
         self.u = np.array([self.u]).T
         self.s = list(self.switch_list)
-        self.x = [str(x)[:-3] for x in self.expanded_statespace.x.tolist()[0]]
-        self.x = np.array([self.x]).T
-        # TODO: check x
+        try:
+            self.x = [str(x)[:-3] for x in self.expanded_statespace.x.tolist()[0]]
+            self.x = np.array([self.x]).T
+        except:
+            self.x = None
+
         self.y = self.expanded_outputs
-        self.dy = self.ydict()
+        self.output_items = self.ydict().items()
 
         self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
         self.diode_V_input_indices = [self.expanded_inputs.index(Vstr) for Vstr in self.diode_V]
@@ -86,7 +85,7 @@ class PowerCircuit:
         self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
         self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
         
-        self.create_matrix()
+        self.create_ABCD()
 
 
     def expand_netlist(self, netlist_str):
@@ -96,7 +95,6 @@ class PowerCircuit:
         """
         lines = netlist_str.strip().split('\n')
         new_netlist = []
-        new_symbolic_netlist = []
         switches = {}
         diodes = {}
         
@@ -114,9 +112,7 @@ class PowerCircuit:
                 
                 # Create the V_f source and the series resistance
                 new_netlist.append(f"R_{name} {anode} {int_node} {{R_{name}}}")
-                new_netlist.append(f"V_{name} {int_node} {cathode} {self.Vf}")
-                new_symbolic_netlist.append(f"R_{name} {anode} {int_node}")
-                new_symbolic_netlist.append(f"V_{name} {int_node} {cathode}")
+                new_netlist.append(f"V_{name} {int_node} {cathode} {{V_{name}}}")
                 diodes[name] = (f"V_{name}", f"R_{name}", f"int_{name}")
             elif parts[0].startswith('SW') and len(parts) >= 3:
                 name = parts[0]           # e.g., SW1
@@ -125,20 +121,20 @@ class PowerCircuit:
                 
                 # Create the switch resistance
                 new_netlist.append(f"R_{name} {Np} {Nm} {{R_{name}}}")
-                new_symbolic_netlist.append(f"R_{name} {Np} {Nm} {{R_{name}}}")
                 switches[name] = (f"R_{name}")
             else:
                 new_netlist.append(line)
-                new_symbolic_netlist.append(f"{parts[0]} {parts[1]} {parts[2]}")
-        return '\n'.join(new_netlist), '\n'.join(new_symbolic_netlist), switches, diodes
+        return '\n'.join(new_netlist), switches, diodes
 
 
-    def create_matrix(self):
+    def create_ABCD(self):
         """
-        Enumerate all possible switch states (closed and open switches,
-        blocking and forward biased diodes). 
-
-        Returns a list of 4-tuples. Each 4-tuple contains 
+        Creates an array of an array of matrices A, B, C and D of the
+        correct size. A[sw_arrd][d_addrr] will retrieve the A matrix for a
+        switch and diode state. sw_addr follows from the dot product of 
+        the switch state array with self.switch_addr .
+        This procedure also creates the mcache matrix cache so that each
+        matrix is computed maximum 1 time.
         """
     
         num_switch_states = 2 ** self.num_switches
@@ -160,15 +156,7 @@ class PowerCircuit:
         self.mcache = np.zeros(states, dtype = bool)
 
 
-    def array_from_addr(self, addr, length):
-        l = [1 if digit=='1' else 0 for digit in bin(addr)[2:]]
-        pad = length - len(l)
-        if pad > 0:
-            l = pad * [0] + l
-        return np.array(l, dtype = int)
-
-
-    def get_matrix(self, sw_addr, d_addr):
+    def compute_matrix(self, sw_addr, d_addr, sw_array, d_array):
         # The assignment of values to a specific switch or diode happens here.
         # self.switch_R[i] is the resistor that implements the switch.
         # The order is identical to self.switch_list / self.diode_list.
@@ -180,8 +168,8 @@ class PowerCircuit:
             D = self.D[sw_addr][d_addr]
             return A, B, C, D
 
-        sw_array = self.array_from_addr(sw_addr, self.num_switches)
-        d_array = self.array_from_addr(d_addr, self.num_diodes)
+        #sw_array = self.array_from_addr(sw_addr, self.num_switches)
+        #d_array = self.array_from_addr(d_addr, self.num_diodes)
         RDB = {}
         for i in range(self.num_switches):
             switch_state = sw_array[i]
@@ -189,7 +177,7 @@ class PowerCircuit:
             RDB[self.switch_R[i]] = Rsw
         for i in range(self.num_diodes):
             switch_state = d_array[i]
-            Rsw = self.Rds_on * switch_state + self.Rds_off * (1 - switch_state)
+            Rsw = self.Rdf * switch_state + self.Rdr * (1 - switch_state)
             RDB[self.diode_R[i]] = Rsw
         subcircuit = self.expanded_circuit.subs(RDB)
         substate = subcircuit.state_space()
@@ -199,12 +187,10 @@ class PowerCircuit:
             C = self.C[sw_addr][d_addr] = np.array(substate.C.tolist(), dtype=float)
         except:
             A = B = C = None
-            print("No reactive elements found")
             # TODO check this in sim
         D = self.D[sw_addr][d_addr] = np.array(substate.D.tolist(), dtype=float)
         self.mcache[sw_addr][d_addr] = True
         print(". ", end="")
-        return A, B, C, D
 
 
     def ydict(self):
@@ -221,7 +207,8 @@ class PowerCircuit:
             del d["i_" + R]
         s = {key: d[key] for key in sorted(d, key=d.get)}  # ordered by key
         return s
-            
+
+
     def t(self, *args):
         if len(args) <2:
             raise ValueError("t requires 2 or 3 arguments \
@@ -280,21 +267,16 @@ class PowerCircuit:
         else:
             x = np.zeros((self.Ashape[0], 1), dtype=float)
 
-        if self.Ashape == (0, 0):
-            LC = False
-        else:
-            LC = True  # L and / or C, circuit stores energy
-
         d_addr = 0
         prev_d_addr = d_addr
         d_array = np.zeros(2 ** self.num_diodes)
-        
-        A, B, C, D = self.get_matrix(sw_addr, d_addr)
 
-        u = np.ones((len(self.expanded_inputs), 1)) * self.Vf
-
-        if fixed_input:
-            u = u_exp
+        if not self.mcache[sw_addr][d_addr]:
+            self.compute_matrix(sw_addr, d_addr, sw_array, d_array)
+        A = self.A[sw_addr][d_addr]
+        B = self.B[sw_addr][d_addr]
+        C = self.C[sw_addr][d_addr]
+        D = self.D[sw_addr][d_addr]
 
         output = np.empty((self.num_expanded_outputs, n), dtype = float)
         
@@ -302,7 +284,7 @@ class PowerCircuit:
             if not fixed_input:
                 u = u_exp[:, [i]]
 
-            if LC:
+            if self.x:
                 xdot = A @ x + B @ u
                 x += xdot * dt
                 y = C @ x + D @ u
@@ -312,14 +294,22 @@ class PowerCircuit:
             I_diodes = y[self.diode_I_V_output_indices].T[0]
             forward = (I_diodes > 0) * 1
             d_addr = np.dot(forward, self.diode_addr)
-            A, B, C, D = self.get_matrix(sw_addr, d_addr)
 
             if d_addr != prev_d_addr:
-                y = C @ x + D @ u
-
+                if self.x:
+                    y = C @ x + D @ u
+                else:
+                    y = D @ u
+                if not self.mcache[sw_addr][d_addr]:
+                    self.compute_matrix(sw_addr, d_addr, sw_array, forward)
+                A = self.A[sw_addr][d_addr]
+                B = self.B[sw_addr][d_addr]
+                C = self.C[sw_addr][d_addr]
+                D = self.D[sw_addr][d_addr]
+            prev_d_addr = d_addr
             output[:, [i]] = y
 
-        return {k: output[i] for k, i in self.dy.items() }
+        return {k: output[i] for k, i in self.output_items}
         
     def __str__(self):
         s  = "PowerCircuit with netlist:\n"
@@ -348,7 +338,7 @@ C1 2 0 1e-3
 """
 
 netlist = """
-V1 1 0 5
+V1 1 0
 V2 5 0 7
 D0 1 2
 R1 2 0 100
