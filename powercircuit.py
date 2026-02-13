@@ -327,17 +327,17 @@ class PowerCircuit:
         return s
         
 
-netlist = """
+netlist_fb = """
 V1 1 3 0
 D0 0 1
 D1 1 2
 D2 0 3
 D3 3 2
-R1 2 0 25
+R1 2 0 100
 C1 2 0 1e-3
 """
 
-netlist = """
+netlist_d = """
 V1 1 0
 V2 5 0 7
 D0 1 2
@@ -349,7 +349,7 @@ SW1 2 0
 
 
 
-pc = PowerCircuit(netlist)
+pc = PowerCircuit(netlist_fb)
 print(pc)
 
 t = pc.t(60e-3, 1e-8)
@@ -359,9 +359,9 @@ dt = 0.06 / 10000
 
 Vin = 12 * np.sin(6.28 * 50 * t)
 n = len(Vin)
-u = np.array([Vin, Vin])
+u = np.array([Vin])
 
-y = pc.sim_step(u, [0], n, dt)
+y = pc.sim_step(u, [], n, dt)
 
 
 import sys
