@@ -74,7 +74,6 @@ class PowerCircuit:
         except:
             self.x = None
 
-        self.y = self.expanded_outputs
         self.output_items = self.ydict().items()
 
         self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
@@ -92,6 +91,7 @@ class PowerCircuit:
         self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
         self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
 
+        self.y = list(self.ydict().keys())
         self.mkcache()
 
 
@@ -289,9 +289,7 @@ class PowerCircuit:
         d_addr = 0
         d_addr_prev = d_addr
         d_array = np.zeros(self.num_diodes, dtype=int)
-        x_prev = x.copy()
-
-
+        
         if not self.M_cache[sw_addr][d_addr]:
             self.abcd(sw_addr, d_addr, sw_array, d_array)
         A = self.A[sw_addr][d_addr]
@@ -303,6 +301,9 @@ class PowerCircuit:
         Ab = self.Ab[sw_addr][d_addr]
         Bb = self.Bb[sw_addr][d_addr]
         output = np.empty((self.num_expanded_outputs, n), dtype = float)
+
+        x_prev = x.copy()
+        forward_prev = np.zeros(self.num_diodes, dtype=bool)
         
         for i in range(n):
             if not fixed_input:
@@ -317,14 +318,14 @@ class PowerCircuit:
                 y = D @ u
 
             I_diodes = y[self.diode_I_V_output_indices].T[0]
+            V_diodes = I_diodes * self.Rdr
             forward = (I_diodes > 0) * 1
+            switched = (forward != forward_prev)
+            if switched.any():
+                print(switched, forward, i * dt)
             d_addr = np.dot(forward, self.diode_addr)
 
             if d_addr != d_addr_prev:
-                if self.x:
-                    y = C @ x + D @ u
-                else:
-                    y = D @ u
                 if not self.M_cache[sw_addr][d_addr]:
                     self.abcd(sw_addr, d_addr, sw_array, forward)
                 A = self.A[sw_addr][d_addr]
@@ -335,7 +336,13 @@ class PowerCircuit:
                     self.be(sw_addr, d_addr, dt)
                 Ab = self.Ab[sw_addr][d_addr]
                 Bb = self.Bb[sw_addr][d_addr]
+                if self.x:
+                    x = (Ab @ x_prev) + (Bb @ u)
+                    y = C @ x + D @ u
+                else:
+                    y = D @ u
             d_addr_prev = d_addr
+            forward_prev = forward.copy()
             x_prev = x.copy()
             output[:, [i]] = y
 
@@ -344,16 +351,22 @@ class PowerCircuit:
     def __str__(self):
         s  = "PowerCircuit with netlist:\n"
         s += self.netlist
-        s += "\nExpanded netlist:\n"
-        s += self.expanded_netlist
-        s += "\n\nSwitches:\n"
+        #s += "\nExpanded netlist:\n"
+        #s += self.expanded_netlist
+        s += "\nSwitches: "
         s += str(list(self.switch_list))
-        s += "\n\nDiodes:\n"
+        s += "\nDiodes: "
         s += str(list(self.diode_list))
-        s += "\n\nExpanded circuit inputs:\n"
-        s += str(self.expanded_inputs)
-        s += "\n\nExpanded circuit outputs:\n"
-        s += str(self.expanded_outputs)
+        #s += "\n\nExpanded circuit inputs:\n"
+        #s += str(self.expanded_inputs)
+        #s += "\n\nExpanded circuit outputs:\n"
+        #s += str(self.expanded_outputs)
+        s += "\nstate vector: "
+        s += str(self.x)        
+        s += "\ninputs: "
+        s += str(self.u)
+        s += "\noutputs: "
+        s += str(self.y)
         return s
         
 
@@ -363,8 +376,8 @@ D0 0 1
 D1 1 2
 D2 0 3
 D3 3 2
-R1 2 0 100
-C1 2 0 500e-6
+R1 2 0 10000
+C1 2 0 1e-6
 """
 
 netlist_d = """
@@ -386,6 +399,7 @@ t = pc.t(60e-3, 1e-8)
 
 t = np.linspace(0, 0.06, 1001)
 dt = 0.06 / 1000
+print(dt)
 
 Vin = 12 * np.sin(6.28 * 50 * t)
 n = len(Vin)
@@ -394,8 +408,6 @@ u = np.array([Vin])
 y = pc.sim_step(u, [], n, dt)
 
 
-import sys
-#sys.exit(0)
 import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()
@@ -405,8 +417,8 @@ ax.set(ylabel="V(V)")
 ax2 = ax.twinx()
 ax2.set(ylabel="I(A)")
 ax.plot(t, y["v_1"]-y["v_3"], linewidth=1, label="Vin")
-ax2.plot(t, y["i_D0"], linewidth=1, label="Idiode", color="tab:green")
-ax.plot(t, y["v_2"], linewidth=1, label="Vout", color="tab:red")
+ax2.plot(t, y["i_D1"], linewidth=1, label="Idiode", color="tab:green")
+ax.plot(t, y['v_2'], linewidth=1, label="Vout", color="tab:red")
 #ax.legend(loc="lower left")
 #ax2.legend()
 
