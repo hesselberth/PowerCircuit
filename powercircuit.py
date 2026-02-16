@@ -12,14 +12,20 @@ analysis) from LCapy and expands it to a switching circuit.
 """
 
 
+import matplotlib
+#matplotlib.use('QtAgg')
+import matplotlib.pyplot as plt
+
 import numpy as np
 from lcapy import Circuit, pprint
+
+
 
 
 # Default switch values, SI units
 Rds_on = 0.01  # SWitch on
 Rds_off = 1e7  # SWitch off is modeled as a high resistance state
-Vf = 0.7       # Diode voltage drop
+Vf = 0.6       # Diode voltage drop
 Rdf = 0.05     # Diode forward resistance
 Rdr = 1e6      # Diode reverse blocking is modeled as a resistance state
 
@@ -72,7 +78,6 @@ class PowerCircuit:
         except:
             self.x = None
 
-        self.y = self.expanded_outputs
         self.output_items = self.ydict().items()
 
         self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
@@ -89,21 +94,10 @@ class PowerCircuit:
 
         self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
         self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
-        
-        try:
-            import numba
-            self.compile_all()
-            self.have_numba = True
-        except ModuleNotFoundError:
-            self.have_numba = False
-            print("numba not found")
 
-        self.create_ABCD()
-        import time
-        t0 = time.time()
-        print(subA(np.zeros(self.num_switches), np.zeros(self.num_diodes)))
-        t1 = time.time()
-        print(t1-t0)
+        self.y = list(self.ydict().keys())
+        self.mkcache()
+
 
     def expand_netlist(self, netlist_str):
         """
@@ -144,7 +138,7 @@ class PowerCircuit:
         return '\n'.join(new_netlist), switches, diodes
 
 
-    def create_ABCD(self):
+    def mkcache(self):
         """
         Creates an array of an array of matrices A, B, C and D of the
         correct size. A[sw_arrd][d_addrr] will retrieve the A matrix for a
@@ -170,14 +164,19 @@ class PowerCircuit:
         self.C = np.zeros(states + self.Cshape)
         self.D = np.zeros(states + self.Dshape)
         
-        self.mcache = np.zeros(states, dtype = bool)
+        self.Ab = np.zeros(states + self.Ashape)
+        self.Bb = np.zeros(states + self.Bshape)
+        self.Ab_m = np.zeros(states + self.Ashape)
+        self.Bb_m = np.zeros(states + self.Bshape)
+        
+        self.abcd_cache = np.zeros(states, dtype = bool)
+        self.flush_be_cache(0)
 
 
-    def compute_matrix(self, sw_addr, d_addr, sw_array, d_array):
+    def abcd(self, sw_addr, d_addr, sw_array, d_array):
         # The assignment of values to a specific switch or diode happens here.
         # self.switch_R[i] is the resistor that implements the switch.
         # The order is identical to self.switch_list / self.diode_list.
-
         RDB = {}
         for i in range(self.num_switches):
             switch_state = sw_array[i]
@@ -187,60 +186,43 @@ class PowerCircuit:
             switch_state = d_array[i]
             Rsw = self.Rdf * switch_state + self.Rdr * (1 - switch_state)
             RDB[self.diode_R[i]] = Rsw
-        #print(self.Rdf * d_array + self.Rdr * (1 - d_array))
-        subcircuit = self.expanded_circuit.subs(RDB)
-        substate = subcircuit.state_space()
-        try:
-            A = self.A[sw_addr][d_addr] = np.array(substate.A.tolist(), dtype=float)
-            #A = self.A[sw_addr][d_addr] = np.array(subA(sw_array, d_array), dtype=float)
-            B = self.B[sw_addr][d_addr] = np.array(substate.B.tolist(), dtype=float)
-            #B = self.A[sw_addr][d_addr] = np.array(subB(sw_array, d_array), dtype=float)
-            C = self.C[sw_addr][d_addr] = np.array(substate.C.tolist(), dtype=float)
-            #C = self.A[sw_addr][d_addr] = np.array(subC(sw_array, d_array), dtype=float)
-        except:
-            print("exc")
+        if self.x:
+            self.A[sw_addr][d_addr] = np.array(self.sym_A.subs(RDB).tolist(), dtype=float)
+            self.B[sw_addr][d_addr] = np.array(self.sym_B.subs(RDB).tolist(), dtype=float)
+            self.C[sw_addr][d_addr] = np.array(self.sym_C.subs(RDB).tolist(), dtype=float)
+        else:
             A = B = C = None
             # TODO check this in sim
-        D = self.D[sw_addr][d_addr] = np.array(substate.D.tolist(), dtype=float)
-        self.mcache[sw_addr][d_addr] = True
+        self.D[sw_addr][d_addr] = np.array(self.sym_D.subs(RDB).tolist(), dtype=float)
+        self.abcd_cache[sw_addr][d_addr] = True
         print(". ", end="")
 
 
-    def sub(self, name, sym_matrix):
-        txt = (str(sym_matrix))
-        if txt[:7].lower() == "matrix(" and txt[-1] == ")":
-            matrix = txt[7:-1]
-        else:
-            raise ValueError("Unexpected format of Sympy Matrix")
-        Rds_on = self.Rds_on
-        Rds_off = self.Rds_off
-        Rdf = self.Rdf
-        Rdr = self.Rdr
+    def be(self, sw_addr, d_addr, sw_array, d_array, m, dt):
+        if not self.abcd_cache[sw_addr][d_addr]:
+            self.abcd(sw_addr, d_addr, sw_array, d_array)
+        if m != self.m_cache:
+            raise ValueError("cach was set up fot different m value " 
+                             f"({self.m_cache}), flush it first")
+        dt_micro = dt / m
+        A = self.A[sw_addr][d_addr]
+        B = self.B[sw_addr][d_addr]
+        I = np.eye(self.Ashape[0])
+        if self.x:
+            print("calc")
+            self.Ab[sw_addr][d_addr] = np.linalg.inv(I - dt * A)
+            self.Bb[sw_addr][d_addr] = self.Ab[sw_addr][d_addr] @ (dt * B)
+            self.Ab_m[sw_addr][d_addr] = np.linalg.inv(I - dt_micro * A)
+            self.Bb_m[sw_addr][d_addr] = self.Ab_m[sw_addr][d_addr] @ (dt_micro * B)
+        self.be_cache[sw_addr][d_addr] = True
 
-        code = [f"def sub{name}(sw_array, d_array):\n"]
-        code.append(f"    global sub{name}\n")
-        if self.switch_R:
-            code.append("    ")
-            code.append(",".join(self.switch_R))
-            code.append(f"={Rdson}*sw_array + {Rdsoff}*(1 - sw_array)\n")
-        if self.diode_R:
-            code.append("    ")
-            code.append(",".join(self.diode_R))
-            code.append(f"={Rdf}*d_array + {Rdr}*(1 - d_array)\n")
-        code.append("    result=")
-        code.append(matrix)
-        code.append("\n    return result\n")
-        code = "".join(code)
-        print(code)
-        codeobj = compile(code, "powercircuit", "exec")
-        exec(codeobj)
-    
-    def compile_all(self):
-        self.sub("A", self.sym_A)
-        self.sub("B", self.sym_B)
-        self.sub("C", self.sym_C)
-        self.sub("D", self.sym_D)
-        
+
+    def flush_be_cache(self, m):
+           states = (2 ** self.num_switches, 2 ** self.num_diodes)
+           self.be_cache = np.zeros(states, dtype = bool)  # Flush Icache
+           self.dt_cache = 0
+           self.m_cache = m
+
 
     def ydict(self):
         d = {name : i for i, name in enumerate(self.expanded_outputs)}
@@ -276,7 +258,99 @@ class PowerCircuit:
         return np.arange(tstart, tstop, dt)
 
 
-    def sim_step(self, u, s, n, dt, x=None):
+    def sim_step(self, sw_addr, d_addr, sw_array, d_array, u_exp, x, m, t, dt, lc, result):
+        x_prev = x
+        d_array_prev = d_array
+        dt_micro = dt / m
+        
+        # Try a dt step
+        u = u_exp[:, [t]]
+        if not self.be_cache[sw_addr][d_addr]:
+            self.be(sw_addr, d_addr, sw_array, d_array, m, dt) # Loads into self.Ab, self.Bb
+        Ab = self.Ab[sw_addr][d_addr]
+        Bb = self.Bb[sw_addr][d_addr]
+        C = self.C[sw_addr][d_addr]
+        D = self.D[sw_addr][d_addr]
+        
+        # Trial integration
+        if lc:
+            x_trial = (Ab @ x_prev) + (Bb @ u)
+            y_trial = C @ x_trial + D @ u
+        else:
+            y_trial = D @ u
+                
+        I_diodes = y_trial[self.diode_I_V_output_indices].T[0]
+        d_array_trial = (I_diodes > 0) * 1
+        
+        # Check for diode commutation
+        if (d_array_trial == d_array_prev).all():
+            # No switching, accept the macro step
+            #print("tn", t, u[0])
+            x = x_trial
+            y = y_trial
+            d_array = d_array_trial
+        else:
+            # Commutation detected, backtrack.
+            # Prepare micro-interpolation for u
+            #print("commutation discovered at", t)
+            utm1 = u_exp[:, [t-1]] if t > 0 else u_exp[:, [t]]
+            ut = u_exp[:, [t]] 
+            du = ut - utm1
+            # (arange(1, m+1) / m to end up at end of macro interval
+            u_interpolated = utm1 + (np.arange(1, m + 1 ) / m) * du
+            #t_micro = t - 1 + np.arange(1, m+1 ) / (m)
+            # Microstepping loop
+            for i in range(m):
+                x_prev = x  # from calling argument
+                assert(m == self.m_cache)
+                u_micro = u_interpolated[:, [i]]
+                #t_i = 0.00006 * t_micro[i]
+                #v_i = 12 * np.sin(6.28 * 50 * t_i)
+                #u_micro[0] = v_i
+                # print("tc", t-1 + ((i+1) / m), t_micro[i], u_micro[0], v_i , u_micro[0]- v_i)
+
+                # Fetch micro matrices for interval dt/m, m>1
+                if not self.be_cache[sw_addr][d_addr]:
+                    self.be(sw_addr, d_addr, sw_array, d_array, m, dt) 
+                Abm = self.Ab_m[sw_addr][d_addr]
+                Bbm = self.Bb_m[sw_addr][d_addr]
+                C = self.C[sw_addr][d_addr]
+                D = self.D[sw_addr][d_addr]
+                
+                #Integrate microstep
+                if lc:
+                    x = (Abm @ x_prev) + (Bbm @ u_micro)
+                    y = C @ x + D @ u_micro
+                else:
+                    y = D @ u_micro
+                
+                # Check commutation within microstep
+                I_diodes = y[self.diode_I_V_output_indices].T[0]
+                d_array = (I_diodes > 0) * 1
+                
+                if (d_array != d_array_prev).any():
+                    # Update topology mid-micro-loop
+                    #print("commutation", d_array, t_micro[i] )
+                    d_addr = int(np.dot(d_array, self.diode_addr))
+                    d_array_prev = d_array
+                    # Re-run this microstep with new topology
+                    if not self.be_cache[sw_addr][d_addr]:
+                        self.be(sw_addr, d_addr, sw_array, d_array, m, dt) 
+                    Abm = self.Ab_m[sw_addr][d_addr]
+                    Bbm = self.Bb_m[sw_addr][d_addr]
+                    C = self.C[sw_addr][d_addr]
+                    D = self.D[sw_addr][d_addr]
+                    if lc:
+                        x = (Abm @ x_prev) + (Bbm @ u_micro)
+                        y = C @ x + D @ u_micro
+                    else:
+                        y = D @ u_micro
+                
+        result[:, [t]] = y
+        return sw_addr, d_addr, d_array, x
+
+
+    def sim(self, u, s, n, dt, m = 1, x=None):
         """
         Perform a number of simulation time steps.
         dt : Time step in seconds.
@@ -291,16 +365,19 @@ class PowerCircuit:
         nsteps : Integer specifying the number of steps to simulate.
         """
         
-        if u.shape == (self.num_inputs, 1):
-            fixed_input = True
-            u_exp = np.ones((self.num_expanded_inputs, 1)) * self.Vf
-        elif u.shape == (self.num_inputs, n):
-            fixed_input = False
-            u_exp = np.ones((self.num_expanded_inputs, n), dtype = float) * self.Vf
+        # if user passed row vector or list, fix it
+        if isinstance(u, list):
+            u = np.array(u)
+        if u.shape == (1, self.num_inputs):
+            col_vector = np.array(u).reshape(-1, 1)
+            u = np.tile(col_vector, (1, n))
+            assert(u.shape == (self.num_inputs, n))
+        if u.shape == (self.num_inputs, n):
+            u_exp = np.ones((self.num_expanded_inputs, n)) * self.Vf
             u_exp[self.expanded_input_indices] = u
         else:
             raise ValueError(f"Input array must have shape (m, 1) or (m, n) " 
-                              "where m is the number of inputs.")
+                             f"where m is the number of inputs (got {u.shape})")
 
         if len(s) == self.num_switches:  # Values must be bool or 0/1
             sw_array = np.array(s, dtype=bool) * 1
@@ -311,79 +388,65 @@ class PowerCircuit:
 
         if x != None:
             if x.shape != (self.Ashape[0], 1):
-                raise(ValueError(f"x should have shape {self.Ashape}, "
-                                 f"(got {x.shape}."))
+                raise ValueError(f"x should have shape {self.Ashape}, "
+                                 f"(got {x.shape}.")
         else:
-            x = np.zeros((self.Ashape[0], 1), dtype=float)
+            x = np.zeros((self.Ashape[0], 1))
+            
 
+        if dt <=0:
+            raise ValueError("timestep dt <= 0")
+
+        if not isinstance(m, int):
+            raise TypeError(f"m must be integer (got {type(m)})")
+        if m < 1:
+            raise ValueError(f"m must be positive (got {m})")
+        
+        if self.dt_cache != dt or self.m_cache != m:
+            self.flush_be_cache(m)
+
+        lc = (x.shape != (0, 0))  # self.x
+        print("lc", lc, x.shape)
         d_addr = 0
-        prev_d_addr = d_addr
-        d_array = np.zeros(self.num_diodes)
-
-        if not self.mcache[sw_addr][d_addr]:
-            self.compute_matrix(sw_addr, d_addr, sw_array, d_array)
-        A = self.A[sw_addr][d_addr]
-        B = self.B[sw_addr][d_addr]
-        C = self.C[sw_addr][d_addr]
-        D = self.D[sw_addr][d_addr]
-
+        d_array = np.zeros(self.num_diodes, dtype=int)
         output = np.empty((self.num_expanded_outputs, n), dtype = float)
         
         for i in range(n):
-            if not fixed_input:
-                u = u_exp[:, [i]]
-
-            if self.x:
-                xdot = A @ x + B @ u
-                x += xdot * dt
-                y = C @ x + D @ u
-            else:
-                y = D @ u
-
-            I_diodes = y[self.diode_I_V_output_indices].T[0]
-            forward = (I_diodes > 0) * 1
-            d_addr = np.dot(forward, self.diode_addr)
-
-            if d_addr != prev_d_addr:
-                if self.x:
-                    y = C @ x + D @ u
-                else:
-                    y = D @ u
-                if not self.mcache[sw_addr][d_addr]:
-                    self.compute_matrix(sw_addr, d_addr, sw_array, forward)
-                A = self.A[sw_addr][d_addr]
-                B = self.B[sw_addr][d_addr]
-                C = self.C[sw_addr][d_addr]
-                D = self.D[sw_addr][d_addr]
-            prev_d_addr = d_addr
-            output[:, [i]] = y
+            sw_addr, d_addr, d_array, x = self.sim_step(sw_addr, d_addr, sw_array, d_array, u_exp, x, m, i, dt, lc, output)
 
         return {k: output[i] for k, i in self.output_items}
-        
+
+
     def __str__(self):
         s  = "PowerCircuit with netlist:\n"
         s += self.netlist
-        s += "\nExpanded netlist:\n"
-        s += self.expanded_netlist
-        s += "\n\nSwitches:\n"
+        #s += "\nExpanded netlist:\n"
+        #s += self.expanded_netlist
+        s += "\nSwitches: "
         s += str(list(self.switch_list))
-        s += "\n\nDiodes:\n"
+        s += "\nDiodes: "
         s += str(list(self.diode_list))
-        s += "\n\nExpanded circuit inputs:\n"
-        s += str(self.expanded_inputs)
-        s += "\n\nExpanded circuit outputs:\n"
-        s += str(self.expanded_outputs)
+        #s += "\n\nExpanded circuit inputs:\n"
+        #s += str(self.expanded_inputs)
+        #s += "\n\nExpanded circuit outputs:\n"
+        #s += str(self.expanded_outputs)
+        s += "\nstate vector: "
+        s += str(self.x)        
+        s += "\ninputs: "
+        s += str(self.u)
+        s += "\noutputs: "
+        s += str(self.y)
         return s
-        
+
 
 netlist_fb = """
-V1 1 3 0
+V1 1 3 
 D0 0 1
 D1 1 2
 D2 0 3
 D3 3 2
 R1 2 0 100
-C1 2 0 1e-3
+C1 2 0 100e-6
 """
 
 netlist_d = """
@@ -391,31 +454,26 @@ V1 1 0
 V2 5 0 7
 D0 1 2
 R1 2 0 100
-R2 2 3 0.1
-C1 3 0 1e-3
+R2 2 3 0.001
+C1 3 0 200e-6
 SW1 2 0
 """
 
 
-
-pc = PowerCircuit(netlist_fb)
+pc = PowerCircuit(netlist_d)
 print(pc)
 
-t = pc.t(60e-3, 1e-8)
-
-t = np.linspace(0, 0.06, 10001)
-dt = 0.06 / 10000
+dt = 0.00012
+i = np.arange(1000)
+t = i * dt
 
 Vin = 12 * np.sin(6.28 * 50 * t)
 n = len(Vin)
-u = np.array([Vin])
+u = np.array([Vin, Vin])
 
-y = pc.sim_step(u, [], n, dt)
+y = pc.sim(u, [0], n, dt, 1)
 
 
-import sys
-#sys.exit(0)
-import matplotlib.pyplot as plt
 
 fig, ax = plt.subplots()
 ax.set_title("Diode test")
@@ -423,14 +481,14 @@ ax.set(xlabel="t")
 ax.set(ylabel="V(V)")
 ax2 = ax.twinx()
 ax2.set(ylabel="I(A)")
-ax.plot(t, y["v_1"], linewidth=1, label="Vin")
+ax.plot(t, y["v_1"] - 0*y["v_3"], linewidth=1, label="Vin")
 ax2.plot(t, y["i_D0"], linewidth=1, label="Idiode", color="tab:green")
-ax.plot(t, y["v_2"], linewidth=1, label="Vout", color="tab:red")
-#ax.legend(loc="lower left")
-#ax2.legend()
+ax.plot(t, y['v_2'], linewidth=1, label="Vout", color="tab:red")
+ax.legend(loc="lower left")
+ax2.legend()
 
-
-
+plt.show()
+print(pc.expanded_inputs)
 
 # # Diode turns ON if above 0.7V, but stays ON until below 0.6V
 # # current_states is the boolean array from the PREVIOUS timestep
