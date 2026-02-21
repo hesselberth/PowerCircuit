@@ -5,21 +5,16 @@ Created on Wed Feb  4 14:05:58 2026
 
 @author: Marcel Hesselberth
 
-Library to simulate power electronic circuits comprising of sources, linear
+Library to simulate power electronic circuits comprised of sources, linear
 circuit elements like resistors, capacitors and inductors and nonlinear
 elements like diodes and switches. The library takes the MNA (modified nodal
 analysis) from LCapy and expands it to a switching circuit.
 """
 
 
-import matplotlib
-#matplotlib.use('QtAgg')
-import matplotlib.pyplot as plt
-
+import os, re
 import numpy as np
-from lcapy import Circuit, pprint
-
-
+from lcapy import Circuit
 
 
 # Default switch values, SI units
@@ -30,15 +25,18 @@ Rdf = 0.05     # Diode forward resistance
 Rdr = 1e6      # Diode reverse blocking is modeled as a resistance state
 
 
-"""
-Class implementing a nonlinear circuit containing switches and diodes.
-Because of the nonlinear nature of these circuits algebraic analysis is
-generally impossible. To increase computational performance, all sympy
-matrices are therefore converted to numpy. This means that no component
-values may be left unspecified.
-"""
 class PowerCircuit:
+    """
+    Class implementing a nonlinear circuit containing switches and diodes.
+    Because of the nonlinear nature of these circuits algebraic analysis is
+    generally impossible. To increase computational performance, all sympy
+    matrices are therefore converted to numpy. This means that no component
+    values may be left unspecified.
+    """
     def __init__(self, netlist, **kwargs):
+        """Constructor.
+        The main argument is a string containing a netlist
+        """
         self.netlist = netlist
 
         self.Rds_on = Rds_on
@@ -59,12 +57,13 @@ class PowerCircuit:
         
         self.switch_list = list(self.switch_db.keys())
         self.diode_list = list(self.diode_db.keys())
+        
         self.switch_R = [self.switch_db[switch] for switch in self.switch_list]
         self.diode_V = [self.diode_db[diode][0] for diode in self.diode_list]
         self.diode_R = [self.diode_db[diode][1] for diode in self.diode_list]
         self.diode_int = [self.diode_db[diode][2] for diode in self.diode_list]
-        self.expanded_inputs = [str(inp) for inp in self.expanded_statespace.u]
-        
+
+        self.expanded_inputs = [str(inp) for inp in self.expanded_statespace.u]        
         self.expanded_outputs = [str(outp)[:-3] for outp in self.expanded_statespace.y]
         self.num_expanded_inputs = len(self.expanded_inputs)
         self.num_expanded_outputs = len(self.expanded_outputs)
@@ -72,12 +71,14 @@ class PowerCircuit:
         self.u = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
         self.u = np.array([self.u]).T
         self.s = list(self.switch_list)
+        self.d = list(self.diode_list)
+        
         try:
             self.x = [str(x)[:-3] for x in self.expanded_statespace.x.tolist()[0]]
             self.x = np.array([self.x]).T
         except:
             self.x = None
-
+        self.y = list(self.ydict().keys())
         self.output_items = self.ydict().items()
 
         self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
@@ -85,7 +86,6 @@ class PowerCircuit:
         self.diode_I_V_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_V]
         self.diode_I_R_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_R]
         self.diode_v_int_output_indices = [self.expanded_outputs.index("v_"+outp) for outp in self.diode_int]
-
         self.input_indices = [inp for inp in self.expanded_inputs if str(inp) not in self.diode_V]
 
         self.num_inputs = self.u.shape[0]
@@ -95,24 +95,67 @@ class PowerCircuit:
         self.switch_addr = 2 ** np.arange(self.num_switches, dtype = int)[::-1]
         self.diode_addr = 2 ** np.arange(self.num_diodes, dtype = int)[::-1]
 
-        self.y = list(self.ydict().keys())
         self.mkcache()
 
+    def draw(self, *args, **kwargs):
+        nodepat = r"(\S+)\s+(\S+)\s+([^;\s]+)\s*(.*)"
+        lines = self.netlist.strip().split('\n')
+        draw_netlist = []
+        nodes = [n[2:] for n in self.y if n.startswith("v_")]
+        replace = {'0': '0'}
+        def replace_node(n):
+            v = "v_" + n
+            if v in self.y or "_" in n:
+                return n
+            elif n in replace:
+                return replace[n]
+            else:
+                new = "_" + n
+                while "_" + new in self.y:
+                    new = "_" + new
+                replace[n] = new
+                print(replace)
+                return new
+        for line in lines:
+            line = line.strip()
+            if line.startswith("#"):
+                pass  # comment
+            else:
+                match = re.match(nodepat, line)
+                if match:
+                    part, np, nn, rem = match.groups()
+                    np = replace_node(np)
+                    nn = replace_node(nn)
+                    if part.lower() == "gnd":
+                        part = "W_gndsink"
+                        rem = rem + ", ground, size=0.0"
+                    s = " ".join([part, np, nn, rem])
+            draw_netlist.append(s)
+        draw_netlist = "\n".join(draw_netlist)
+        print(draw_netlist)
+
+                    
+        cct = Circuit(draw_netlist)
+        return cct.draw(*args, **kwargs)
 
     def expand_netlist(self, netlist_str):
         """
-        Replaces 'Dname n1 n2' with a series R and V source and
+        Substitute diodes and switches.
+        Replaces 'Dname n1 n2' with a series R and Vf and
         SWname n1 n2 by R.
+        Argument: a string containing a netlist.
+        Returns: 3-tuple: an expanded netlist, switch dict and diode dict.
         """
         lines = netlist_str.strip().split('\n')
         new_netlist = []
+        draw_netlist = []
         switches = {}
         diodes = {}
         
         for line in lines:
             line = line.strip()
             parts = line.split()
-            if not parts: continue
+            if not parts or parts[0].lower() == "gnd": continue
             
             # Check if the component is a diode (starts with D)
             if parts[0].startswith('D') and len(parts) >= 3:
@@ -125,6 +168,7 @@ class PowerCircuit:
                 new_netlist.append(f"R_{name} {anode} {int_node} {{R_{name}}}")
                 new_netlist.append(f"V_{name} {int_node} {cathode} {{V_{name}}}")
                 diodes[name] = (f"V_{name}", f"R_{name}", f"int_{name}")
+            # Check if the component is a switch (starts with SW)
             elif parts[0].startswith('SW') and len(parts) >= 3:
                 name = parts[0]           # e.g., SW1
                 Np = parts[1]             # e.g., 2
@@ -135,7 +179,8 @@ class PowerCircuit:
                 switches[name] = (f"R_{name}")
             else:
                 new_netlist.append(line)
-        return '\n'.join(new_netlist), switches, diodes
+            
+        return os.linesep.join(new_netlist), switches, diodes
 
 
     def mkcache(self):
@@ -144,8 +189,13 @@ class PowerCircuit:
         correct size. A[sw_arrd][d_addrr] will retrieve the A matrix for a
         switch and diode state. sw_addr follows from the dot product of 
         the switch state array with self.switch_addr .
-        This procedure also creates the mcache matrix cache so that each
-        matrix is computed maximum 1 time.
+        This procedure also creates the abcd_cache matrix cache so that
+        each possible topology is computed maximum once.
+        
+        Also creates Ab and Bb matrices for backward Euler integration
+        and Ab_m and Bb_m matrices for times-m microstepping. These matrices
+        depend on integration time dt. As long as dt and m are not changed,
+        those matrices are cached as well, using be_cache as a hit indicator.
         """
     
         num_switch_states = 2 ** self.num_switches
@@ -159,15 +209,15 @@ class PowerCircuit:
 
         states = (num_switch_states, num_diode_states)
 
-        self.A = np.zeros(states + self.Ashape)
-        self.B = np.zeros(states + self.Bshape)
-        self.C = np.zeros(states + self.Cshape)
-        self.D = np.zeros(states + self.Dshape)
+        self.A = np.zeros(states + self.Ashape, dtype = float)
+        self.B = np.zeros(states + self.Bshape, dtype = float)
+        self.C = np.zeros(states + self.Cshape, dtype = float)
+        self.D = np.zeros(states + self.Dshape, dtype = float)
         
-        self.Ab = np.zeros(states + self.Ashape)
-        self.Bb = np.zeros(states + self.Bshape)
-        self.Ab_m = np.zeros(states + self.Ashape)
-        self.Bb_m = np.zeros(states + self.Bshape)
+        self.Ab = np.zeros(states + self.Ashape, dtype = float)
+        self.Bb = np.zeros(states + self.Bshape, dtype = float)
+        self.Ab_m = np.zeros(states + self.Ashape, dtype = float)
+        self.Bb_m = np.zeros(states + self.Bshape, dtype = float)
         
         self.abcd_cache = np.zeros(states, dtype = bool)
         self.flush_be_cache(0)
@@ -176,7 +226,7 @@ class PowerCircuit:
     def abcd(self, sw_addr, d_addr, sw_array, d_array):
         # The assignment of values to a specific switch or diode happens here.
         # self.switch_R[i] is the resistor that implements the switch.
-        # The order is identical to self.switch_list / self.diode_list.
+        # The order is identical that of self.switch_list / self.diode_list.
         RDB = {}
         for i in range(self.num_switches):
             switch_state = sw_array[i]
@@ -187,15 +237,13 @@ class PowerCircuit:
             Rsw = self.Rdf * switch_state + self.Rdr * (1 - switch_state)
             RDB[self.diode_R[i]] = Rsw
         if self.x:
-            self.A[sw_addr][d_addr] = np.array(self.sym_A.subs(RDB).tolist(), dtype=float)
-            self.B[sw_addr][d_addr] = np.array(self.sym_B.subs(RDB).tolist(), dtype=float)
-            self.C[sw_addr][d_addr] = np.array(self.sym_C.subs(RDB).tolist(), dtype=float)
+            self.A[sw_addr][d_addr] = np.array(self.sym_A.subs(RDB).tolist())
+            self.B[sw_addr][d_addr] = np.array(self.sym_B.subs(RDB).tolist())
+            self.C[sw_addr][d_addr] = np.array(self.sym_C.subs(RDB).tolist())
         else:
-            A = B = C = None
-            # TODO check this in sim
-        self.D[sw_addr][d_addr] = np.array(self.sym_D.subs(RDB).tolist(), dtype=float)
+            A = B = C = None  # stateless circuit
+        self.D[sw_addr][d_addr] = np.array(self.sym_D.subs(RDB).tolist())
         self.abcd_cache[sw_addr][d_addr] = True
-        print(". ", end="")
 
 
     def be(self, sw_addr, d_addr, sw_array, d_array, m, dt):
@@ -204,7 +252,7 @@ class PowerCircuit:
         if m != self.m_cache:
             raise ValueError("cach was set up fot different m value " 
                              f"({self.m_cache}), flush it first")
-        dt_micro = dt / m
+        dt_micro = dt / m  # dt for microstepping
         A = self.A[sw_addr][d_addr]
         B = self.B[sw_addr][d_addr]
         I = np.eye(self.Ashape[0])
@@ -219,7 +267,7 @@ class PowerCircuit:
 
     def flush_be_cache(self, m):
            states = (2 ** self.num_switches, 2 ** self.num_diodes)
-           self.be_cache = np.zeros(states, dtype = bool)  # Flush Icache
+           self.be_cache = np.zeros(states, dtype = bool)
            self.dt_cache = 0
            self.m_cache = m
 
@@ -285,23 +333,23 @@ class PowerCircuit:
         # Check for diode commutation
         if (d_array_trial == d_array_prev).all():
             # No switching, accept the macro step
-            #print("tn", t, u[0])
+            # print("tn", t, u[0])
             x = x_trial
             y = y_trial
             d_array = d_array_trial
         else:
             # Commutation detected, backtrack.
             # Prepare micro-interpolation for u
-            #print("commutation discovered at", t)
+            # print("commutation discovered at", t)
             utm1 = u_exp[:, [t-1]] if t > 0 else u_exp[:, [t]]
             ut = u_exp[:, [t]] 
             du = ut - utm1
             # (arange(1, m+1) / m to end up at end of macro interval
             u_interpolated = utm1 + (np.arange(1, m + 1 ) / m) * du
-            #t_micro = t - 1 + np.arange(1, m+1 ) / (m)
+            # t_micro = t - 1 + np.arange(1, m+1 ) / (m)
             # Microstepping loop
             for i in range(m):
-                x_prev = x  # from calling argument
+                x_prev = x  # first pass from function argument
                 assert(m == self.m_cache)
                 u_micro = u_interpolated[:, [i]]
                 #t_i = 0.00006 * t_micro[i]
@@ -344,8 +392,7 @@ class PowerCircuit:
                         x = (Abm @ x_prev) + (Bbm @ u_micro)
                         y = C @ x + D @ u_micro
                     else:
-                        y = D @ u_micro
-                
+                        y = D @ u_micro  
         result[:, [t]] = y
         return sw_addr, d_addr, d_array, x
 
@@ -445,8 +492,8 @@ D0 0 1
 D1 1 2
 D2 0 3
 D3 3 2
-R1 2 0 100
-C1 2 0 100e-6
+R1 2 0 10
+C1 2 0 1000e-6
 """
 
 netlist_d = """
@@ -459,12 +506,25 @@ C1 3 0 200e-6
 SW1 2 0
 """
 
+netlist_d = """
+V1 1 0_1; down
+D0 1 2; right, size=1.5
+R2 2 3 0.1; down, b=100
+C1 3 0 1000e-6; down
+W1 2 4; right
+R1 4 0_4 100; down
+W4 0 0_4; right
+W5 0_1 0; right
+gnd 0 0_g; down
+"""
 
-pc = PowerCircuit(netlist_fb)
+pc = PowerCircuit(netlist_d)
 print(pc)
 
-dt = 0.00012
-i = np.arange(1000)
+pc.draw()
+
+dt = 0.000012
+i = np.arange(10000)
 t = i * dt
 
 Vin = 12 * np.sin(6.28 * 50 * t)
@@ -473,6 +533,9 @@ u = np.array([Vin])
 
 y = pc.sim(u, [], n, dt, 1)
 
+
+import matplotlib
+import matplotlib.pyplot as plt
 
 
 fig, ax = plt.subplots()
@@ -489,6 +552,7 @@ ax2.legend()
 
 plt.show()
 print(pc.expanded_inputs)
+print(pc.y)
 
 # # Diode turns ON if above 0.7V, but stays ON until below 0.6V
 # # current_states is the boolean array from the PREVIOUS timestep
