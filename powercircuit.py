@@ -151,8 +151,7 @@ class PowerCircuit:
         self.output_items = self.ydict.items()
 
         self.expanded_input_indices = [self.expanded_inputs.index(inp) for inp in self.u]
-        #self.diode_V_input_indices = [self.expanded_inputs.index(Vstr) for Vstr in self.diode_V]
-        self.diode_V_input_indices = []
+        self.diode_V_input_indices = [self.expanded_inputs.index(Vstr) for Vstr in self.diode_V]
         self.diode_I_V_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_V]
         self.diode_I_R_output_indices = [self.expanded_outputs.index("i_"+outp) for outp in self.diode_R]
         self.diode_v_int_output_indices = [self.expanded_outputs.index("v_"+outp) for outp in self.diode_int]
@@ -339,14 +338,12 @@ class PowerCircuit:
         # The order is identical that of self.switch_list / self.diode_list.
         RDB = {}
         for i in range(self.num_switches):
-            switch_state = sw_array[i]
-            Rsw = self.Rds_on * switch_state + self.Rds_off * (1 - switch_state)
-            RDB[self.switch_R[i]] = Rsw
+            on = sw_array[i]
+            RDB[self.switch_R[i]] = self.Rds_on if on else self.Rds_off
         for i in range(self.num_diodes):
-            switch_state = d_array[i]
-            Rsw = self.Rdf * switch_state + self.Rdr * (1 - switch_state)
-            RDB[self.diode_R[i]] = Rsw
-            #RDB[self.diode_V[i]] = self.Vf
+            on = d_array[i]
+            RDB[self.diode_R[i]] = self.Rdf if on else self.Rdr
+            RDB[self.diode_V[i]] = self.Vf #* on
         args = [RDB[s] for s in self.symbols]
         if self.x:
             self.A[sw_addr][d_addr] = self.lambd_A(*args)
@@ -366,12 +363,6 @@ class PowerCircuit:
         A = self.A[sw_addr][d_addr]
         B = self.B[sw_addr][d_addr]
         I = np.eye(self.Ashape[0])
-        
-        B_ext = B[:, self.expanded_input_indices]
-        B_vf = B[:, self.diode_V_input_indices]
-        Vf_vector = np.full((self.num_diodes, 1), self.Vf)
-        #self.f_b[sw_addr][d_addr] = (self.Ab[sw_addr][d_addr] @ (dt * B_vf)) @ Vf
-        #self.Bb[sw_addr][d_addr] = self.Ab[sw_addr][d_addr] @ (dt * B_ext)
         
         if self.x:
             print("calc")
@@ -455,8 +446,8 @@ class PowerCircuit:
         else:
             y_trial = D @ u
                 
-        I_diodes = y_trial[self.diode_I_V_output_indices].T[0]
-        d_array_trial = (I_diodes > 0) * 1
+        I_diodes = y_trial[self.diode_I_V_output_indices].ravel()
+        d_array_trial = (I_diodes > 1e-10) * 1  # 1e-10: supress numerical noise
         
         # Check for diode commutation
         if (d_array_trial == d_array_prev).all():
@@ -700,14 +691,12 @@ axs.axis('off')
 plt.tight_layout()
 
 
-
+print("u symbols:", [str(u) for u in pc.expanded_statespace.u])
+print("Does V_D0 appear in u? →", any('V_D0' in str(u) for u in pc.expanded_statespace.u))
+print("y contains i_V_D0?", any('i_V_D0' in str(y) for y in pc.expanded_statespace.y))
+print("y contains i_R_D0?", any('i_R_D0' in str(y) for y in pc.expanded_statespace.y))
 
 plt.show()
 
 
-
-# # Diode turns ON if above 0.7V, but stays ON until below 0.6V
-# # current_states is the boolean array from the PREVIOUS timestep
-# is_high = y[diode_indices] > 0.7
-# is_low = y[diode_indices] < 0.6
 
