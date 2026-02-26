@@ -12,7 +12,7 @@ analysis) from LCapy and expands it to a switching circuit.
 """
 
 
-import os, re
+import re
 import numpy as np
 from lcapy import Circuit
 from sympy import lambdify
@@ -607,13 +607,22 @@ class PowerCircuit:
 
 
 netlist_fb = """
-V1 1 3 
-D0 0 1
-D1 1 2
-D2 0 3
-D3 3 2
-R1 2 0 10
-C1 2 0 1000e-6
+V1 p m ; down
+W1 p 1; right, size=2
+W2 m 3; right , size=2
+D0 0_0 1 ; rotate=45, size=1.5
+D1 1 2 ; rotate=-45, size=1.5
+D2 0_0 3 ; rotate=-45, size=1.5
+D3 3 2 ; rotate=45, size=1.5
+W3 2 4; right
+W4 0_0 0_1 ; down, size=1.5
+W5 0_1 0; right
+C1 4 0 1000e-6 .1; down, size=1.5
+R1 5 0_2 100; down
+W7 4 5 ; right, size=1.5
+W8 0 0_2; right
+gnd 0 0_g ; down
+
 """
 
 netlist_d = """
@@ -639,7 +648,7 @@ gnd 0 0_g; down
 ; style=american
 """
 
-pc = PowerCircuit(netlist_d)
+pc = PowerCircuit(netlist_fb)
 
 print("exp inp:")
 print(pc.expanded_inputs)
